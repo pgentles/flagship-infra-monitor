@@ -349,21 +349,8 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
           security: [{ bearerAuth: [] }],
           parameters: [
             { name: "url", in: "path", required: true, schema: { type: "string" }, description: "Monitored URL (encode special chars)" },
-            { name: "agent", in: "query", required: false, schema: { type: "string" }, description: "Agent identifier" },
+            { name: "agent", in: "query", required: true, schema: { type: "string" }, description: "Agent identifier" },
           ],
-          requestBody: {
-            required: false,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    agent: { type: "string", description: "Agent identifier" },
-                  },
-                },
-              },
-            },
-          },
           responses: {
             "200": { description: "Monitor status" },
             "402": {
