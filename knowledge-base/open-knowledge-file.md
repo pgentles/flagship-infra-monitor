@@ -4,6 +4,8 @@
 > **Owner:** Patrick Gentles (pgpgentles@gmail.com)
 > **Wallet:** `0x421C25445d6CF7B292933D743E698ed24dE36270`
 > **Network:** Base (eip155:8453), USDC: `0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA`
+> **MCP VPS:** 2.24.30.104 (srv1791950) — Ubuntu Noble, Node 20.20.2
+> **Main VPS:** 187.77.202.93 (hermes2) — Render deployments + cron jobs
 
 ---
 
@@ -19,7 +21,45 @@ Flagship Universe is a suite of paid APIs for AI agents, each implementing the x
 | Flagship Law | flagship-law.onrender.com | ✅ Live | ✅ Registered | pgentles/flagship-law |
 | Flagship Compliance | flagship-compliance.onrender.com | ✅ Live | ✅ Registered | pgentles/flagship-compliance |
 | Flagship Resume ATS | flagship-resume-ats.onrender.com | ✅ Live | ✅ Registered | pgentles/flagship-resume-ats |
-| Flagship Infra Monitor | flagship-infra-monitor.onrender.com | ✅ Live | ⏳ Pending | pgentles/flagship-infra-monitor |
+| Flagship Infra Monitor | flagship-infra-monitor.onrender.com | ✅ Live | ⚠️ 2/3 registered | pgentles/flagship-infra-monitor |
+
+### MCP Server
+
+| Component | Details |
+|-----------|---------|
+| URL | ssh root@2.24.30.104 |
+| Location | /opt/flagship-mcp-server/ |
+| Build | `npm run build` (esbuild, 52ms) |
+| Run | `node /opt/flagship-mcp-server/dist/server.js` (stdio JSON-RPC) |
+| Tools | 21 tools across all 5 Flagship services |
+| Repo | pgentles/flagship-mcp-server |
+| Status | ✅ Deployed & Tested (8/8 tests passed) |
+| Auto-pay | FALLBACK_PAYMENT header handles x402 |
+| Claude Desktop | `"command": "ssh", "args": ["-x", "root@2.24.30.104", "node /opt/flagship-mcp-server/dist/server.js"]` |
+
+---
+
+### Infrastructure
+
+| Host | IP | Purpose | Services |
+|------|-------|---------|----------|
+| Render (cloud) | — | Paid API deployments | All 5 Flagship APIs |
+| VPS (main) | 187.77.202.93 | Cron jobs, DNS | Sales monitors, sales monitor crons |
+| VPS (MCP) | 2.24.30.104 | MCP server, future APIs | flagship-mcp-server |
+
+### MCP Server Protocol
+
+```
+Claude Desktop → ssh + stdio → MCP Server (2.24.30.104)
+                                    ↓
+                         Auto-pays x402 (FALLBACK_PAYMENT header)
+                                    ↓
+                         Flagship APIs (Render, HTTPS + x402)
+                                    ↓
+                         Returns data to Claude
+```
+
+The MCP server acts as a bridge: AI agents discover it via Claude Desktop, call tools, and the server handles x402 payment automatically using the registered FALLBACK_PAYMENT header.
 
 ---
 
@@ -337,3 +377,14 @@ curl -s https://flagship-infra-monitor.onrender.com/api/sales
 - **USDC Contract:** `0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA`
 - **x402scan Facilitator:** `https://x402scan.com/facilitator`
 - **Portfolio Site:** flagshipuniverse.com
+- **MCP Server SSH:** `ssh root@2.24.30.104`
+
+---
+
+## 8. Build Commands Quick Reference
+
+| Service | Build | Start |
+|---------|-------|-------|
+| kronos-x402 | `npm run build` (tsc) | `npm start` |
+| flagship-*, infra-monitor | `npm run build` (npm install && tsc) | `npm start` |
+| flagship-mcp-server | `npm run build` (esbuild) | `node dist/server.js` |
