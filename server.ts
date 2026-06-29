@@ -1,9 +1,5 @@
-import express from "express";
-import { Request, Response } from "express";
+import express, { Request, Response } from "express";
 import crypto from "crypto";
-import https from "https";
-import http from "http";
-import { URL } from "url";
 
 // ============================================================
 //  Types
@@ -66,23 +62,37 @@ async function checkHealth(
   keyword?: string
 ): Promise<HealthCheck> {
   const start = Date.now();
-  const parsedUrl = new URL(url);
-  const isHttps = parsedUrl.protocol === "https:";
 
   return new Promise((resolve) => {
-    const lib = isHttps ? https : http;
-    const request = lib.get(
-      url,
-      {
+    try {
+      const parsedUrl = new URL(url);
+      const isHttps = parsedUrl.protocol === "https:";
+
+      if (!isHttps && parsedUrl.protocol !== "http:") {
+        resolve({
+          url,
+          statusCode: 0,
+          statusText: "Only http/https supported",
+          responseTime: Date.now() - start,
+          sslDaysRemaining: null,
+          contentType: "unknown",
+          contentLength: 0,
+          timestamp: new Date().toISOString(),
+          healthy: false,
+        });
+        return;
+      }
+
+      const options = {
         headers: { "User-Agent": "Flagship-Infra-Monitor/1.0" },
         rejectUnauthorized: false,
-      },
-      (res) => {
+        timeout: timeoutMs,
+      };
+
+      const req = (isHttps ? require("https") : require("http")).get(url, options, (res: any) => {
         const responseTime = Date.now() - start;
         let data = "";
-        res.on("data", (chunk) => {
-          data += chunk;
-        });
+        res.on("data", (chunk: Buffer) => { data += chunk; });
         res.on("end", () => {
           let keywordFound: boolean | undefined = undefined;
           if (keyword !== undefined) {
@@ -90,14 +100,11 @@ async function checkHealth(
           }
 
           let sslDaysRemaining: number | null = null;
-          const resAny = res as any;
-          if (resAny.socket && resAny.socket.getPeerCertificate) {
-            const cert = resAny.socket.getPeerCertificate();
+          if (res.socket && (res.socket as any).getPeerCertificate) {
+            const cert = (res.socket as any).getPeerCertificate();
             if (cert && cert.valid_to) {
               const expiry = new Date(cert.valid_to).getTime();
-              sslDaysRemaining = Math.floor(
-                (expiry - Date.now()) / (1000 * 60 * 60 * 24)
-              );
+              sslDaysRemaining = Math.floor((expiry - Date.now()) / (1000 * 60 * 60 * 24));
             }
           }
 
@@ -114,26 +121,24 @@ async function checkHealth(
             keywordFound,
           });
         });
-      }
-    );
-
-    request.on("error", () => {
-      resolve({
-        url,
-        statusCode: 0,
-        statusText: "Connection Failed",
-        responseTime: Date.now() - start,
-        sslDaysRemaining: null,
-        contentType: "unknown",
-        contentLength: 0,
-        timestamp: new Date().toISOString(),
-        healthy: false,
       });
-    });
 
-    if (typeof request.setTimeout === "function") {
-      request.setTimeout(timeoutMs, () => {
-        request.destroy();
+      req.on("error", () => {
+        resolve({
+          url,
+          statusCode: 0,
+          statusText: "Connection Failed",
+          responseTime: Date.now() - start,
+          sslDaysRemaining: null,
+          contentType: "unknown",
+          contentLength: 0,
+          timestamp: new Date().toISOString(),
+          healthy: false,
+        });
+      });
+
+      req.on("timeout", () => {
+        req.destroy();
         resolve({
           url,
           statusCode: 0,
@@ -146,6 +151,18 @@ async function checkHealth(
           healthy: false,
         });
       });
+    } catch {
+      resolve({
+        url,
+        statusCode: 0,
+        statusText: "Invalid Request",
+        responseTime: Date.now() - start,
+        sslDaysRemaining: null,
+        contentType: "unknown",
+        contentLength: 0,
+        timestamp: new Date().toISOString(),
+        healthy: false,
+      });
     }
   });
 }
@@ -154,59 +171,60 @@ async function checkHealth(
 //  x402 Payment Middleware (V2 Spec)
 // ============================================================
 
-const FREE_PATHS = new Set(["/api/monitors", "/api/health", "/api/status", "/api/sales", "/openapi.json", "/health"]);
+const FREE_PATHS: string[] = ["/api/monitors", "/api/health", "/api/status", "/api/sales", "/openapi.json", "/health"];
 
-function generatePaymentChallenge(res: Response) {
-  const paymentInfo = {
-    description: "Payment required to access this endpoint",
-    "x-guidance": "Send USDC to the address provided",
-    "x-network": "eip155:8453",
-    methods: [
-      {
-        network: "eip155:8453",
-        receiver: "0x421C25445d6CF7B292933D743E698ed24dE36270",
-        asset: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",
-        maxTimeoutSeconds: 60,
-      },
-    ],
+const BASE_NETWORK_CAIP2 = "eip155:8453";
+const USDC_BASE_MAINNET = "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA";
+const WALLET = "0x421C25445d6CF7B292933D743E698ed24dE36270";
+
+function generatePaymentChallenge(req: Request, res: Response) {
+  const resourceUrl = `https://${req.headers.host}${req.path}`;
+  const endpointName = req.path.replace(/\/\{.*\}/, "").split("/").filter(Boolean).pop() || "unknown";
+
+  const priceMap: Record<string, string> = {
+    "api/add": "20000",
+    "api/remove": "50000",
+    "api/status": "30000",
   };
+  const amount = priceMap[endpointName] || "20000";
 
-  res.setHeader(
-    "WWW-Authenticate",
-    `x402 nonce=${Date.now().toString(36)}`
-  );
-  res.setHeader(
-    "Payment-Required",
-    Buffer.from(JSON.stringify(paymentInfo)).toString("base64")
-  );
-  res.status(402).json({
-    error: "payment_required",
-    ...paymentInfo,
-  });
+  const accepts = [{
+    scheme: "exact",
+    network: BASE_NETWORK_CAIP2,
+    amount,
+    asset: USDC_BASE_MAINNET,
+    payTo: WALLET,
+    maxTimeoutSeconds: 60,
+    resource: {
+      url: resourceUrl,
+      description: `Uptime monitoring and health checks — ${endpointName}`,
+      mimeType: "application/json",
+      serviceName: "Flagship Infra Monitor",
+      tags: ["monitoring", "uptime", "health-check", "infra"],
+    },
+    extra: { name: "USDC", version: "2" },
+  }];
+
+  const body = { x402Version: 2, accepts, wallet: WALLET };
+  const b64 = Buffer.from(JSON.stringify(body)).toString("base64");
+
+  res.set("X-Payment-Protocol", "x402");
+  res.set("X402-Payment", "required");
+  res.set("Payment-Required", b64);
+  return res.status(402).json(body);
 }
 
 function x402Middleware(req: Request, res: Response, next: () => void) {
-  if (FREE_PATHS.has(req.path)) {
+  if (FREE_PATHS.includes(req.path)) {
     return next();
   }
 
-  const payment =
-    (req.headers["x-payment"] as string) ||
-    (req.headers["X-Payment"] as string);
-  const auth =
-    (req.headers["authorization"] as string) ||
-    (req.headers["Authorization"] as string);
-
-  if (!payment && !auth) {
-    return generatePaymentChallenge(res);
+  const payment = req.headers["x402-payment"] || req.headers["X402-Payment"];
+  if (!payment) {
+    return generatePaymentChallenge(req, res);
   }
 
-  const validAuth =
-    auth && (auth.includes("x402") || auth.includes("Bearer"));
-  if (!validAuth && !payment) {
-    return generatePaymentChallenge(res);
-  }
-
+  // Payment received → record sale
   x402SalesData.total += 1;
   x402SalesData.timestamp = new Date().toISOString();
   x402SalesData.endpoint = req.path;
@@ -215,7 +233,7 @@ function x402Middleware(req: Request, res: Response, next: () => void) {
 }
 
 // ============================================================
-//  Express App + OpenAPI + Routes
+//  Express App + Middleware
 // ============================================================
 
 const app = express();
@@ -232,44 +250,27 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
-// OpenAPI spec
+// ============================================================
+//  OpenAPI Spec
+// ============================================================
+
 app.get("/openapi.json", (_req: Request, res: Response) => {
   res.json({
     openapi: "3.1.0",
     info: {
       title: "Flagship Infra Monitor API",
       version: "1.0.0",
-      description:
-        "Uptime monitoring, health checks, and status reports for URLs",
+      description: "Uptime monitoring, health checks, and status reports for URLs",
       contact: { email: "pgpgentles@gmail.com" },
-      "x-guidance":
-        "Add URLs to monitor, check their health, and receive uptime reports",
+      "x-guidance": "Add URLs to monitor, check their health, and receive uptime reports",
       "x-payment-info": {
         endpoints: {
-          "POST /api/add": {
-            price_usdc: 0.02,
-            description: "Add URL to monitor (max 10/agent)",
-          },
-          "POST /api/remove": {
-            price_usdc: 0.05,
-            description: "Remove URL from monitoring list",
-          },
-          "GET /api/status/{url}": {
-            price_usdc: 0.03,
-            description: "Get specific monitor status",
-          },
-          "POST /api/health": {
-            price_usdc: 0,
-            description: "On-demand health check (free)",
-          },
-          "GET /api/monitors": {
-            price_usdc: 0,
-            description: "List all monitors (free)",
-          },
-          "GET /api/sales": {
-            price_usdc: 0,
-            description: "View total sales (free)",
-          },
+          "POST /api/add": { price_usdc: 0.02, description: "Add URL to monitor (max 10/agent)" },
+          "POST /api/remove": { price_usdc: 0.05, description: "Remove URL from monitoring" },
+          "GET /api/status/{url}": { price_usdc: 0.03, description: "Get specific monitor status" },
+          "POST /api/health": { price_usdc: 0, description: "On-demand health check (free)" },
+          "GET /api/monitors": { price_usdc: 0, description: "List all monitors (free)" },
+          "GET /api/sales": { price_usdc: 0, description: "View total sales (free)" },
         },
         network: "eip155:8453",
         asset: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",
@@ -277,9 +278,7 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
         protocols: ["x402"],
       },
     },
-    servers: [
-      { url: "https://flagship-infra-monitor.onrender.com" },
-    ],
+    servers: [{ url: "https://flagship-infra-monitor.onrender.com" }],
     paths: {
       "/api/add": {
         post: {
@@ -295,19 +294,9 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
                   type: "object",
                   required: ["url", "agent"],
                   properties: {
-                    url: {
-                      type: "string",
-                      description: "URL to monitor (must be https)",
-                    },
-                    agent: {
-                      type: "string",
-                      description: "Agent identifier",
-                    },
-                    keyword: {
-                      type: "string",
-                      description:
-                        "Optional keyword that must appear on page",
-                    },
+                    url: { type: "string", description: "URL to monitor (must be https)" },
+                    agent: { type: "string", description: "Agent identifier" },
+                    keyword: { type: "string", description: "Optional keyword that must appear on page" },
                   },
                 },
               },
@@ -317,17 +306,9 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
             "200": { description: "Monitor added successfully" },
             "402": {
               description: "Payment required",
-              content: {
-                "application/json": {
-                  schema: {
-                    $ref: "#/components/schemas/PaymentRequired",
-                  },
-                },
-              },
+              content: { "application/json": { schema: { $ref: "#/components/schemas/PaymentRequired" } } },
             },
-            "409": {
-              description: "Monitor already exists or max limit reached",
-            },
+            "409": { description: "Already exists or max limit" },
             "422": { description: "Invalid URL" },
           },
         },
@@ -345,26 +326,17 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
                 schema: {
                   type: "object",
                   required: ["url", "agent"],
-                  properties: {
-                    url: { type: "string" },
-                    agent: { type: "string" },
-                  },
+                  properties: { url: { type: "string" }, agent: { type: "string" } },
                 },
               },
             },
           },
           responses: {
             "200": { description: "Monitor removed" },
-            "404": { description: "Monitor not found" },
+            "404": { description: "Not found" },
             "402": {
               description: "Payment required",
-              content: {
-                "application/json": {
-                  schema: {
-                    $ref: "#/components/schemas/PaymentRequired",
-                  },
-                },
-              },
+              content: { "application/json": { schema: { $ref: "#/components/schemas/PaymentRequired" } } },
             },
           },
         },
@@ -375,27 +347,14 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
           operationId: "getStatus",
           tags: ["Status"],
           security: [{ bearerAuth: [] }],
-          parameters: [
-            {
-              name: "url",
-              in: "path",
-              required: true,
-              schema: { type: "string" },
-            },
-          ],
+          parameters: [{ name: "url", in: "path", required: true, schema: { type: "string" } }],
           responses: {
             "200": { description: "Monitor status" },
             "402": {
               description: "Payment required",
-              content: {
-                "application/json": {
-                  schema: {
-                    $ref: "#/components/schemas/PaymentRequired",
-                  },
-                },
-              },
+              content: { "application/json": { schema: { $ref: "#/components/schemas/PaymentRequired" } } },
             },
-            "404": { description: "Monitor not found" },
+            "404": { description: "Not found" },
           },
         },
       },
@@ -414,54 +373,33 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
                   required: ["url"],
                   properties: {
                     url: { type: "string" },
-                    keyword: {
-                      type: "string",
-                      description:
-                        "Check if keyword appears on page",
-                    },
-                    timeout: {
-                      type: "integer",
-                      default: 10000,
-                      description: "Timeout in ms",
-                    },
+                    keyword: { type: "string", description: "Check if keyword appears" },
+                    timeout: { type: "integer", default: 10000, description: "Timeout in ms" },
                   },
                 },
               },
             },
           },
-          responses: {
-            "200": { description: "Health check results" },
-          },
+          responses: { "200": { description: "Health check results" } },
         },
       },
       "/api/monitors": {
         get: {
-          summary: "List all monitors for an agent",
+          summary: "List all monitors",
           operationId: "listMonitors",
           tags: ["Monitoring"],
           security: [],
-          parameters: [
-            {
-              name: "agent",
-              in: "query",
-              required: false,
-              schema: { type: "string" },
-            },
-          ],
-          responses: {
-            "200": { description: "List of monitors" },
-          },
+          parameters: [{ name: "agent", in: "query", required: false, schema: { type: "string" } }],
+          responses: { "200": { description: "List of monitors" } },
         },
       },
       "/api/sales": {
         get: {
-          summary: "View total sales (free)",
+          summary: "View total sales",
           operationId: "getSales",
           tags: ["Sales"],
           security: [],
-          responses: {
-            "200": { description: "Sales data" },
-          },
+          responses: { "200": { description: "Sales data" } },
         },
       },
     },
@@ -482,48 +420,39 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
   });
 });
 
+// ============================================================
+//  Routes
+// ============================================================
+
 // POST /api/add - Add monitor
 app.post("/api/add", async (req: Request, res: Response) => {
   const { url, agent, keyword } = req.body;
 
   if (!url || !agent) {
-    return res
-      .status(422)
-      .json({ error: "missing_fields", message: "url and agent are required" });
+    return res.status(422).json({ error: "missing_fields", message: "url and agent are required" });
   }
 
   try {
     new URL(url);
   } catch {
-    return res
-      .status(422)
-      .json({ error: "invalid_url", message: "URL must be a valid URL" });
+    return res.status(422).json({ error: "invalid_url", message: "URL must be valid" });
   }
 
-  const monitorId = crypto
-    .createHash("md5")
-    .update(`${agent}:${url}`)
-    .digest("hex");
+  const monitorId = crypto.createHash("md5").update(`${agent}:${url}`).digest("hex");
 
   if (!agentMonitors.has(agent)) {
     agentMonitors.set(agent, new Set());
   }
   const agentSet = agentMonitors.get(agent)!;
+
   if (!monitors.has(monitorId) && agentSet.size >= MAX_MONITORS_PER_AGENT) {
-    return res.status(409).json({
-      error: "max_limit_reached",
-      message: "Maximum 10 monitors per agent",
-    });
+    return res.status(409).json({ error: "max_limit_reached", message: "Maximum 10 monitors per agent" });
   }
 
   if (monitors.has(monitorId)) {
-    return res.status(409).json({
-      error: "already_exists",
-      message: "This URL is already monitored for this agent",
-    });
+    return res.status(409).json({ error: "already_exists", message: "Already monitoring this URL" });
   }
 
-  // Run initial check
   const health = await checkHealth(url, 10000, keyword);
 
   const monitor: Monitor = {
@@ -544,10 +473,7 @@ app.post("/api/add", async (req: Request, res: Response) => {
   monitors.set(monitorId, monitor);
   agentSet.add(monitorId);
 
-  res.json({
-    message: "Monitor added successfully",
-    monitor,
-  });
+  res.status(200).json({ message: "Monitor added successfully", monitor });
 });
 
 // POST /api/remove - Remove monitor
@@ -555,64 +481,41 @@ app.post("/api/remove", (req: Request, res: Response) => {
   const { url, agent } = req.body;
 
   if (!url || !agent) {
-    return res
-      .status(422)
-      .json({ error: "missing_fields", message: "url and agent are required" });
+    return res.status(422).json({ error: "missing_fields", message: "url and agent required" });
   }
 
-  const monitorId = crypto
-    .createHash("md5")
-    .update(`${agent}:${url}`)
-    .digest("hex");
+  const monitorId = crypto.createHash("md5").update(`${agent}:${url}`).digest("hex");
 
   if (!monitors.has(monitorId)) {
-    return res
-      .status(404)
-      .json({ error: "not_found", message: "Monitor not found" });
+    return res.status(404).json({ error: "not_found", message: "Monitor not found" });
   }
 
   const monitor = monitors.get(monitorId)!;
-  if (monitor.agent !== agent) {
-    return res
-      .status(404)
-      .json({ error: "not_found", message: "Monitor not owned by this agent" });
-  }
-
   monitors.delete(monitorId);
-  agentMonitors.get(agent)?.delete(monitorId);
+  const agentSet = agentMonitors.get(agent);
+  if (agentSet) agentSet.delete(monitorId);
 
-  res.json({ message: "Monitor removed", monitor });
+  res.status(200).json({ message: "Monitor removed", monitor });
 });
 
-// GET /api/status/:url - Get monitor status
+// GET /api/status/:url
 app.get("/api/status/:url", (req: Request, res: Response) => {
   const url = decodeURIComponent(req.params.url);
   const agent = (req.query.agent as string) || "";
 
-  const monitorId = crypto
-    .createHash("md5")
-    .update(`${agent}:${url}`)
-    .digest("hex");
+  const monitorId = crypto.createHash("md5").update(`${agent}:${url}`).digest("hex");
 
   if (!monitors.has(monitorId)) {
-    return res
-      .status(404)
-      .json({ error: "not_found", message: "Monitor not found" });
+    return res.status(404).json({ error: "not_found", message: "Monitor not found" });
   }
 
   const m = monitors.get(monitorId)!;
   const uptimePercent =
     m.totalChecks > 0
-      ? (
-          ((m.totalChecks - m.failedChecks) / m.totalChecks) *
-          100
-        ).toFixed(2) + "%"
+      ? (((m.totalChecks - m.failedChecks) / m.totalChecks) * 100).toFixed(2) + "%"
       : "100%";
 
-  res.json({
-    ...m,
-    uptimePercent,
-  });
+  res.status(200).json({ ...m, uptimePercent });
 });
 
 // POST /api/health - On-demand health check (FREE)
@@ -620,13 +523,11 @@ app.post("/api/health", async (req: Request, res: Response) => {
   const { url, keyword, timeout } = req.body;
 
   if (!url) {
-    return res
-      .status(422)
-      .json({ error: "missing_fields", message: "url is required" });
+    return res.status(422).json({ error: "missing_fields", message: "url is required" });
   }
 
   const health = await checkHealth(url, timeout || 10000, keyword);
-  res.json(health);
+  res.status(200).json(health);
 });
 
 // GET /api/monitors - List monitors (FREE)
@@ -639,13 +540,10 @@ app.get("/api/monitors", (req: Request, res: Response) => {
     if (!agentSet) {
       return res.json({ monitors: [], count: 0 });
     }
-    allMonitors = allMonitors.filter((m) => agentSet.has(m.id));
+    allMonitors = allMonitors.filter((m: Monitor) => agentSet.has(m.id));
   }
 
-  res.json({
-    monitors: allMonitors,
-    count: allMonitors.length,
-  });
+  res.json({ monitors: allMonitors, count: allMonitors.length });
 });
 
 // GET /api/sales - View sales (FREE)
@@ -657,20 +555,26 @@ app.get("/api/sales", (_req: Request, res: Response) => {
 //  Background Monitoring Loop (every 60s)
 // ============================================================
 
+const monitorList: Monitor[] = [];
+
 setInterval(async () => {
-  for (const [id, monitor] of monitors.entries()) {
-    const health = await checkHealth(monitor.url, 10000, monitor.keyword);
-    const updated: Monitor = {
-      ...monitor,
-      totalChecks: monitor.totalChecks + 1,
-      failedChecks: monitor.failedChecks + (health.healthy ? 0 : 1),
-      status: health.healthy ? "up" : "down",
+  monitorList.length = 0;
+  monitors.forEach((m) => { monitorList.push(m); });
+
+  for (let i = 0; i < monitorList.length; i++) {
+    const m = monitorList[i];
+    const health = await checkHealth(m.url, 10000, m.keyword);
+    const updated = {
+      ...m,
+      totalChecks: m.totalChecks + 1,
+      failedChecks: m.failedChecks + (health.healthy ? 0 : 1),
+      status: health.healthy ? ("up" as const) : ("down" as const),
       statusCode: health.statusCode,
       responseTime: health.responseTime,
       sslDaysRemaining: health.sslDaysRemaining,
       lastChecked: health.timestamp,
     };
-    monitors.set(id, updated);
+    monitors.set(m.id, updated);
   }
 }, 60000);
 
