@@ -173,37 +173,58 @@ async function checkHealth(
 
 const FREE_PATHS: string[] = ["/api/monitors", "/api/health", "/api/status", "/api/sales", "/openapi.json", "/health"];
 
-const BASE_NETWORK_CAIP2 = "eip155:8453";
 const USDC_BASE_MAINNET = "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA";
+const BASE_NETWORK_CAIP2 = "eip155:8453";
 const WALLET = "0x421C25445d6CF7B292933D743E698ed24dE36270";
+
+// Price map per endpoint (atomic units) — must match OpenAPI discovery
+const priceMap: Record<string, string> = {
+  "api/add": "20000",      // 0.02 USDC
+  "api/remove": "50000",   // 0.05 USDC
+  "api/status": "30000",   // 0.03 USDC
+};
 
 function generatePaymentChallenge(req: Request, res: Response) {
   const resourceUrl = `https://${req.headers.host}${req.path}`;
   const endpointName = req.path.replace(/\/\{.*\}/, "").split("/").filter(Boolean).pop() || "unknown";
-
-  const priceMap: Record<string, string> = {
-    "api/add": "20000",
-    "api/remove": "50000",
-    "api/status": "30000",
-  };
   const amount = priceMap[endpointName] || "20000";
 
-  const accepts = [{
-    scheme: "exact",
-    network: BASE_NETWORK_CAIP2,
-    amount,
-    asset: USDC_BASE_MAINNET,
-    payTo: WALLET,
-    maxTimeoutSeconds: 60,
-    resource: {
-      url: resourceUrl,
-      description: `Uptime monitoring and health checks — ${endpointName}`,
-      mimeType: "application/json",
-      serviceName: "Flagship Infra Monitor",
-      tags: ["monitoring", "uptime", "health-check", "infra"],
+  // Per x402 spec: provide TWO network requirements — "base" first, then "eip155:8453"
+  // Both with same asset, payTo, amount, resource, scheme: "exact"
+  const accepts = [
+    {
+      scheme: "exact",
+      network: "base",
+      amount,
+      asset: USDC_BASE_MAINNET,
+      payTo: WALLET,
+      maxTimeoutSeconds: 60,
+      resource: {
+        url: resourceUrl,
+        description: `Uptime monitoring and health checks — ${endpointName}`,
+        mimeType: "application/json",
+        serviceName: "Flagship Infra Monitor",
+        tags: ["monitoring", "uptime", "health-check", "infra"],
+      },
+      extra: { name: "USDC", version: "2" },
     },
-    extra: { name: "USDC", version: "2" },
-  }];
+    {
+      scheme: "exact",
+      network: BASE_NETWORK_CAIP2,
+      amount,
+      asset: USDC_BASE_MAINNET,
+      payTo: WALLET,
+      maxTimeoutSeconds: 60,
+      resource: {
+        url: resourceUrl,
+        description: `Uptime monitoring and health checks — ${endpointName}`,
+        mimeType: "application/json",
+        serviceName: "Flagship Infra Monitor",
+        tags: ["monitoring", "uptime", "health-check", "infra"],
+      },
+      extra: { name: "USDC", version: "2" },
+    }
+  ];
 
   const body = { x402Version: 2, accepts, wallet: WALLET };
   const b64 = Buffer.from(JSON.stringify(body)).toString("base64");
